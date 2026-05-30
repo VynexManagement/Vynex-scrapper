@@ -1,0 +1,9 @@
+logs
+venv
+.env
+__pycache__
+*.pyc
+seed_admin.py
+sig.txt
+*.sql
+test_proxy_fix.py

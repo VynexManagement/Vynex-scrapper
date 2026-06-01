@@ -149,43 +149,47 @@ async def run_scraper(
                     return
 
                 if not dry_run and supabase:
-                    store_id = db_writer.upsert_store(supabase, raw_data, niche_for_url, country_for_url)
+                    def db_write_transaction() -> int:
+                        store_id = db_writer.upsert_store(supabase, raw_data, niche_for_url, country_for_url)
+                        if not store_id:
+                            return 0
 
-                    if not store_id:
-                        return
+                        db_writer.insert_raw_data(supabase, store_id, raw_data)
 
-                    db_writer.insert_raw_data(supabase, store_id, raw_data)
+                        base_by_slug = {s.slug: s for s in active_base_signals}
+                        derived_by_slug = {s.slug: s for s in active_derived_signals}
 
-                    base_by_slug = {s.slug: s for s in active_base_signals}
-                    derived_by_slug = {s.slug: s for s in active_derived_signals}
-
-                    for slug in final_signal_slugs:
-                        source = "base" if slug in base_by_slug else "derived"
-                        signal_id = (base_by_slug.get(slug) or derived_by_slug.get(slug)).id
-                        db_writer.insert_store_signal(supabase, store_id, signal_id, source=source)
-
-                    if skip_signal_filter:
-                        created_for_store = 0
                         for slug in final_signal_slugs:
+                            source = "base" if slug in base_by_slug else "derived"
                             signal_entry = base_by_slug.get(slug) or derived_by_slug.get(slug)
-                            if not signal_entry:
-                                continue
-                            signal_id = signal_entry.id
-                            lead_id = db_writer.insert_lead(supabase, store_id, signal_id)
-                            if lead_id and db_writer.link_lead_to_dataset(supabase, dataset_id, lead_id):
-                                created_for_store += 1
-                                logger.info(f"✓ Match: {slug}")
-                        if created_for_store:
-                            matched += created_for_store
-                            logger.info(f"✓ Match: {url} → {created_for_store} signal lead(s)")
-                    else:
-                        selected = base_by_slug.get(signal or "") or derived_by_slug.get(signal or "")
-                        if selected:
-                            signal_id = selected.id
-                            lead_id = db_writer.insert_lead(supabase, store_id, signal_id)
-                            if lead_id and db_writer.link_lead_to_dataset(supabase, dataset_id, lead_id):
-                                matched += 1
-                                logger.info(f"✓ Match: {signal}")
+                            if signal_entry:
+                                db_writer.insert_store_signal(supabase, store_id, signal_entry.id, source=source)
+
+                        created_for_store = 0
+                        if skip_signal_filter:
+                            for slug in final_signal_slugs:
+                                signal_entry = base_by_slug.get(slug) or derived_by_slug.get(slug)
+                                if not signal_entry:
+                                    continue
+                                signal_id = signal_entry.id
+                                lead_id = db_writer.insert_lead(supabase, store_id, signal_id)
+                                if lead_id and db_writer.link_lead_to_dataset(supabase, dataset_id, lead_id):
+                                    created_for_store += 1
+                                    logger.info(f"✓ Match: {slug}")
+                        else:
+                            selected = base_by_slug.get(signal or "") or derived_by_slug.get(signal or "")
+                            if selected:
+                                signal_id = selected.id
+                                lead_id = db_writer.insert_lead(supabase, store_id, signal_id)
+                                if lead_id and db_writer.link_lead_to_dataset(supabase, dataset_id, lead_id):
+                                    created_for_store = 1
+                                    logger.info(f"✓ Match: {signal}")
+                        return created_for_store
+
+                    created_for_store = await asyncio.to_thread(db_write_transaction)
+                    if created_for_store:
+                        matched += created_for_store
+                        logger.info(f"✓ Match: {url} → {created_for_store} signal lead(s)")
 
         tasks = [
             process(url, niche_for_url, country_for_url)
@@ -198,7 +202,7 @@ async def run_scraper(
         await browser.close()
 
     if not dry_run and supabase:
-        db_writer.update_dataset_count(supabase, dataset_id)
+        await asyncio.to_thread(db_writer.update_dataset_count, supabase, dataset_id)
 
     logger.info(f"=== DONE — {matched} matches ===")
 
@@ -208,8 +212,8 @@ async def run_scraper(
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--niche", required=True, choices=VALID_NICHES)
-    parser.add_argument("--country", required=True, choices=VALID_COUNTRIES)
+    parser.add_argument("--niche", required=True)
+    parser.add_argument("--country", required=True)
     parser.add_argument("--signal", help="Signal slug (e.g. no_email_detected)")
     parser.add_argument("--all-signals", action="store_true")
 
@@ -221,10 +225,29 @@ def main():
     if not args.all_signals and not args.signal:
         parser.error("Either --signal or --all-signals is required.")
 
+    niche_input = args.niche.strip().lower()
+    country_input = args.country.strip().lower()
+
+    niche_map = {n.lower(): n for n in VALID_NICHES}
+    country_map = {c.lower(): c for c in VALID_COUNTRIES}
+
+    if niche_input in niche_map:
+        normalized_niche = niche_map[niche_input]
+    else:
+        normalized_niche = args.niche.strip().title()
+
+    if country_input in country_map:
+        normalized_country = country_map[country_input]
+    else:
+        if country_input in ["usa", "uk"]:
+            normalized_country = country_input.upper()
+        else:
+            normalized_country = args.country.strip().title()
+
     asyncio.run(
         run_scraper(
-            niche=args.niche,
-            country=args.country,
+            niche=normalized_niche,
+            country=normalized_country,
             signal=args.signal,
             all_signals=args.all_signals,
             limit=args.limit,

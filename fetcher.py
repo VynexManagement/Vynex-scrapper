@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Any, Optional
 
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -50,41 +50,52 @@ def _extract_product_stats(json_products: Optional[dict[str, Any]]) -> tuple[Opt
     return product_count, avg_price
 
 
-def _fetch_with_requests(url: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+async def _fetch_with_httpx(url: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     headers = {"User-Agent": USER_AGENT}
-    timeout = 20
+    timeout = httpx.Timeout(15.0, connect=5.0)
 
     html: Optional[str] = None
     products_json: Optional[dict[str, Any]] = None
 
-    try:
-        response = requests.get(url, headers=headers, timeout=timeout)
-        if response.ok:
-            html = response.text
-    except requests.RequestException:
-        pass
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        try:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                html = response.text
+        except httpx.HTTPError:
+            pass
 
-    try:
-        products_url = url.rstrip("/") + "/products.json?limit=250"
-        response = requests.get(products_url, headers=headers, timeout=timeout)
-        if response.ok:
-            products_json = response.json()
-    except (requests.RequestException, json.JSONDecodeError, ValueError):
-        pass
+        try:
+            products_url = url.rstrip("/") + "/products.json?limit=250"
+            response = await client.get(products_url, headers=headers)
+            if response.status_code == 200:
+                products_json = response.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+            pass
 
     return html, products_json
 
 
 async def _fetch_with_playwright(url: str, context) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     page = await context.new_page()
+
+    async def route_intercept(route):
+        resource_type = route.request.resource_type
+        if resource_type in ["image", "stylesheet", "font", "media", "other"]:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await page.route("**/*", route_intercept)
+
     try:
-        await page.goto(url, timeout=20_000, wait_until="domcontentloaded")
+        await page.goto(url, timeout=12_000, wait_until="domcontentloaded")
         html = await page.content()
 
         products_json: Optional[dict[str, Any]] = None
         try:
             products_url = url.rstrip("/") + "/products.json?limit=250"
-            response = await page.request.get(products_url, timeout=20_000)
+            response = await page.request.get(products_url, timeout=10_000)
             if response.ok:
                 products_json = await response.json()
         except Exception:
@@ -98,7 +109,7 @@ async def _fetch_with_playwright(url: str, context) -> tuple[Optional[str], Opti
 async def fetch_store_data(url: str, browser_context=None) -> dict[str, Any]:
     normalized_url = _normalize_url(url)
 
-    html, json_products = await asyncio.to_thread(_fetch_with_requests, normalized_url)
+    html, json_products = await _fetch_with_httpx(normalized_url)
 
     if not html and browser_context is not None:
         logger.info("HTTP fetch failed for %s; using Playwright fallback", normalized_url)

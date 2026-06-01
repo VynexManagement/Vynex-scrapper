@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Optional
@@ -52,12 +53,27 @@ def upsert_store(supabase: Client, raw_data: dict[str, Any], niche: str, country
         return None
 
 
+def clean_html(html: str) -> str:
+    if not html:
+        return ""
+    # Strip <script>...</script>
+    html = re.sub(r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', '', html, flags=re.IGNORECASE)
+    # Strip <style>...</style>
+    html = re.sub(r'<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>', '', html, flags=re.IGNORECASE)
+    # Strip <svg>...</svg>
+    html = re.sub(r'<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>', '', html, flags=re.IGNORECASE)
+    # Compact excessive whitespace
+    html = re.sub(r'\s+', ' ', html).strip()
+    return html
+
+
 def insert_raw_data(supabase: Client, store_id: str, raw_data: dict[str, Any]) -> bool:
     try:
         html = raw_data.get("html") or ""
+        cleaned = clean_html(html)
         payload = {
             "store_id": store_id,
-            "html": html,
+            "html": cleaned,
             "json_products": raw_data.get("json_products"),
             "scraped_at": datetime.now(timezone.utc).isoformat(),
             "content_hash": sha256(html.encode("utf-8")).hexdigest(),

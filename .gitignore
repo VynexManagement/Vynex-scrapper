@@ -8,3 +8,4 @@ sig.txt
 *.sql
 test_proxy_fix.py
 docs
+.agent

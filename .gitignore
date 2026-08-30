@@ -9,3 +9,5 @@ sig.txt
 test_proxy_fix.py
 docs
 .agent
+.claude
+fixtures

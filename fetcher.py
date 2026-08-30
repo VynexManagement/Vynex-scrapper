@@ -1,11 +1,39 @@
+"""Storefront fetching with explicit quality gating.
+
+Three behaviours here are deliberate reversals of the previous implementation:
+
+  * Playwright engages on a **bad-but-present** response, not only an empty one.
+    A 403 Cloudflare challenge is still HTML, so the old check passed it through
+    as a successful fetch and scored a store that looked like it had zero apps
+    installed — a perfect-looking false lead.
+  * One shared client per run. The old code built a new AsyncClient per store,
+    and another for subpages: no connection reuse, no shared cookie jar.
+  * Below the quality floor we return a fetch failure and **no signals**.
+    `provider is None` must mean "absent", never "we could not see".
+
+Only 3 subpages are fetched, and only for contact extraction. Provider detection
+reads the homepage alone — concatenating 9 subpages made detection sensitivity a
+function of site size and inflated every vendor match.
+"""
+
 import asyncio
 import json
 import logging
 import re
 from typing import Any, Optional
-from config import TITLE_SEPARATORS
+from xml.etree import ElementTree
 
 import httpx
+
+from config import (
+    HTTP_CONNECT_TIMEOUT_SECONDS,
+    HTTP_TIMEOUT_SECONDS,
+    MIN_HTML_BYTES,
+    MIN_SCRIPT_COUNT,
+    RETRY_ATTEMPTS,
+    SUBPAGE_TIMEOUT_SECONDS,
+)
+from fingerprint import build_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -15,435 +43,351 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-
-def _normalize_url(url: str) -> str:
-    if url.startswith("http://") or url.startswith("https://"):
-        return url
-    return f"https://{url}"
-
-
-def _extract_store_name(html: str, fallback_url: str) -> str:
-    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return fallback_url
-    title = re.sub(r"\s+", " ", match.group(1)).strip()
-    if not title:
-        return fallback_url
-    for sep in TITLE_SEPARATORS:
-        if sep in title:
-            return title.split(sep)[0].strip()
-    return title
-
-
-def _extract_product_stats(json_products: Optional[dict[str, Any]]) -> tuple[Optional[int], Optional[float]]:
-    if not json_products:
-        return None, None
-
-    products = json_products.get("products", [])
-    product_count = len(products)
-
-    prices: list[float] = []
-    for product in products:
-        for variant in product.get("variants", []):
-            try:
-                prices.append(float(variant["price"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-
-    avg_price = round(sum(prices) / len(prices), 2) if prices else None
-    return product_count, avg_price
-
-
-async def _fetch_all_products(client: httpx.AsyncClient, base_url: str, headers: dict) -> Optional[dict]:
-    """
-    Paginates through /products.json to collect all products.
-    Shopify max is 250 per page. Stops at page 5 (1250 products) to prevent abuse.
-    """
-    all_products = []
-    page = 1
-    MAX_PAGES = 5
-
-    while page <= MAX_PAGES:
-        products_url = f"{base_url.rstrip('/')}/products.json?limit=250&page={page}"
-        try:
-            response = await client.get(products_url, headers=headers)
-            if response.status_code != 200:
-                break
-            data = response.json()
-            products = data.get("products", [])
-            if not products:
-                break
-            all_products.extend(products)
-            if len(products) < 250:
-                break  # last page
-            page += 1
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
-            logger.warning("Products page %s fetch failed for %s: %s", page, base_url, e)
-            break
-
-    return {"products": all_products} if all_products else None
-
-
-async def _fetch_with_httpx(url: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    headers = {"User-Agent": USER_AGENT}
-    timeout = httpx.Timeout(15.0, connect=5.0)
-
-    html: Optional[str] = None
-    products_json: Optional[dict[str, Any]] = None
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        try:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                html = response.text
-        except httpx.HTTPError as e:
-            logger.warning("HTML fetch failed for %s: %s (status=%s)", url, e,
-                           getattr(e.response, 'status_code', 'N/A') if hasattr(e, 'response') else 'N/A')
-
-        products_json = await _fetch_all_products(client, url, headers)
-
-    return html, products_json
-
-
-async def _fetch_with_playwright(url: str, context) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    page = await context.new_page()
-
-    async def route_intercept(route):
-        resource_type = route.request.resource_type
-        if resource_type in ["image", "stylesheet", "font", "media", "other"]:
-            await route.abort()
-        else:
-            await route.continue_()
-
-    await page.route("**/*", route_intercept)
-
-    try:
-        await page.goto(url, timeout=12_000, wait_until="domcontentloaded")
-        html = await page.content()
-
-        products_json: Optional[dict[str, Any]] = None
-        try:
-            products_url = url.rstrip("/") + "/products.json?limit=250"
-            response = await page.request.get(products_url, timeout=10_000)
-            if response.ok:
-                products_json = await response.json()
-        except Exception:
-            products_json = None
-
-        return html, products_json
-    finally:
-        await page.close()
-
+STATUS_OK = "ok"
+STATUS_DEAD = "dead"
+STATUS_NOT_SHOPIFY = "not_shopify"
+STATUS_FETCH_FAILED = "fetch_failed"
 
 DEAD_STORE_MARKERS = [
     "this store is currently unavailable",
-    "id=\"shopify-section-password",
+    'id="shopify-section-password',
     "opening soon",
     "coming soon",
     "enter using password",
     "your store is temporarily unavailable",
 ]
 
+# A challenge page is HTML with a 200-ish shape but no storefront in it.
+#
+# Split into strong and weak markers deliberately. A loose `"captcha" in html`
+# gates real stores: plenty of legitimate storefronts mention captcha on a
+# contact form or load a Turnstile widget. Weak markers therefore only count on
+# a page too small to be a storefront.
+STRONG_CHALLENGE_MARKERS = [
+    "cf-browser-verification",
+    "cf-chl-",
+    "checking your browser before accessing",
+    "<title>just a moment",
+    "please enable cookies and reload the page",
+    "ray id:",
+]
+
+WEAK_CHALLENGE_MARKERS = [
+    "captcha",
+    "access denied",
+    "attention required",
+    "enable javascript and cookies to continue",
+    "unusual traffic",
+]
+
+# A real storefront is comfortably larger than any bot wall.
+CHALLENGE_SIZE_CEILING = 50_000
+
+SHOPIFY_INDICATORS = [
+    "cdn.shopify.com",
+    "cdn/shop/",
+    "shopify.theme",
+    "shopifycloud",
+    "shopifyanalytics",
+    "shopify-payment-button",
+    "window.shopify",
+]
+
+MAX_PRODUCT_PAGES = 5
+PRODUCT_TITLE_SAMPLE = 40
+
+
+def normalize_url(url: str) -> str:
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://{url}"
+
+
 def is_dead_store(html: str) -> bool:
-    """
-    Returns True if the store is password-protected, coming soon,
-    or otherwise unavailable. These should never become leads.
-    """
-    html_lower = html.lower()
-    return any(marker in html_lower for marker in DEAD_STORE_MARKERS)
+    lowered = (html or "").lower()
+    return any(marker in lowered for marker in DEAD_STORE_MARKERS)
 
 
-def is_shopify_store(html: str, json_products: Optional[dict] = None) -> bool:
-    """
-    Returns True if the HTML content or products data matches Shopify indicators.
-    """
-    if json_products and "products" in json_products:
+def looks_like_challenge(html: str) -> bool:
+    """True only when the page is a bot wall, not merely a page mentioning one."""
+    lowered = (html or "").lower()
+    if any(marker in lowered for marker in STRONG_CHALLENGE_MARKERS):
         return True
-
-    html_lower = html.lower()
-    indicators = [
-        "cdn.shopify.com",
-        "shopify.theme",
-        "shopifyanalytics",
-        "shopify-payment-button",
-        "content=\"shopify\"",
-        "window.shopify",
-        "/collections/all",
-    ]
-    return any(indicator in html_lower for indicator in indicators)
+    if len(lowered) < CHALLENGE_SIZE_CEILING:
+        return any(marker in lowered for marker in WEAK_CHALLENGE_MARKERS)
+    return False
 
 
-async def _fetch_subpage(client: httpx.AsyncClient, base_url: str, path: str, headers: dict) -> Optional[str]:
-    url = f"{base_url.rstrip('/')}{path}"
+def is_shopify_store(html: str, products: Optional[dict] = None) -> bool:
+    if products and products.get("products"):
+        return True
+    lowered = (html or "").lower()
+    return any(indicator in lowered for indicator in SHOPIFY_INDICATORS)
+
+
+def assess_quality(html: str, fingerprint: dict[str, Any], method: str) -> dict[str, Any]:
+    """Decide whether this fetch may produce signals at all."""
+    html_bytes = fingerprint.get("html_bytes") or 0
+    script_count = fingerprint.get("script_count") or 0
+    markers = fingerprint.get("shopify_markers") or []
+
+    quality: dict[str, Any] = {
+        "html_bytes": html_bytes,
+        "script_count": script_count,
+        "shopify_markers": markers,
+        "method": method,
+        "scoreable": False,
+        "reason": None,
+    }
+
+    if looks_like_challenge(html):
+        quality["reason"] = "bot_challenge"
+        return quality
+    if html_bytes < MIN_HTML_BYTES:
+        quality["reason"] = f"html_too_small({html_bytes})"
+        return quality
+    if script_count < MIN_SCRIPT_COUNT:
+        quality["reason"] = f"too_few_scripts({script_count})"
+        return quality
+    if not markers:
+        quality["reason"] = "no_shopify_markers"
+        return quality
+
+    quality["scoreable"] = True
+    return quality
+
+
+# ── Low-level fetches ────────────────────────────────────────────────────────
+
+async def _get(
+    client: httpx.AsyncClient,
+    url: str,
+    attempts: int = RETRY_ATTEMPTS,
+    timeout: Optional[float] = None,
+) -> Optional[httpx.Response]:
+    """GET with bounded retries. Errors are logged, never silently swallowed."""
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return await client.get(url, timeout=timeout or HTTP_TIMEOUT_SECONDS)
+        except httpx.HTTPError as exc:
+            logger.warning("GET failed (%s/%s) %s: %s", attempt, attempts, url, exc)
+            if attempt < attempts:
+                await asyncio.sleep(1.0 * attempt)
+    return None
+
+
+async def _fetch_products(client: httpx.AsyncClient, base_url: str) -> Optional[dict[str, Any]]:
+    """Paginate /products.json. Capped to avoid hammering large catalogues."""
+    collected: list[dict[str, Any]] = []
+    for page in range(1, MAX_PRODUCT_PAGES + 1):
+        url = f"{base_url.rstrip('/')}/products.json?limit=250&page={page}"
+        response = await _get(client, url, attempts=1)
+        if response is None or response.status_code != 200:
+            break
+        try:
+            products = (response.json() or {}).get("products", [])
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("products.json unparseable for %s: %s", base_url, exc)
+            break
+        if not products:
+            break
+        collected.extend(products)
+        if len(products) < 250:
+            break
+    return {"products": collected} if collected else None
+
+
+def product_stats(products: Optional[dict[str, Any]]) -> tuple[Optional[int], Optional[float], list[str]]:
+    """Return (count, average price, sampled titles)."""
+    if not products:
+        return None, None, []
+
+    items = products.get("products", [])
+    prices: list[float] = []
+    titles: list[str] = []
+    for product in items:
+        title = product.get("title")
+        if title and len(titles) < PRODUCT_TITLE_SAMPLE:
+            titles.append(str(title)[:120])
+        for variant in product.get("variants", []) or []:
+            try:
+                prices.append(float(variant["price"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    avg = round(sum(prices) / len(prices), 2) if prices else None
+    return len(items), avg, titles
+
+
+async def count_blog_articles(client: httpx.AsyncClient, base_url: str) -> Optional[int]:
+    """Count published blog articles via sitemap.xml.
+
+    A positive assertion, unlike the old `/blogs/news` fetch which trusted any
+    HTTP 200 — and Shopify returns 200 with a soft-404 body. Shopify only emits
+    a sitemap_blogs_*.xml child when blogs with published articles exist.
+    Returns None when the sitemap itself is unreachable (unknown, not zero).
+    """
+    response = await _get(client, f"{base_url.rstrip('/')}/sitemap.xml", attempts=1)
+    if response is None or response.status_code != 200:
+        return None
+
     try:
-        response = await client.get(url, headers=headers, timeout=10.0)
-        if response.status_code == 200:
-            final_path = response.url.path.rstrip('/')
-            if final_path in ["", "/"]:
-                return None
-            return response.text
-    except Exception:
-        pass
-    return None
+        root = ElementTree.fromstring(response.text)
+    except ElementTree.ParseError:
+        return None
+
+    blog_sitemaps = [
+        loc.text for loc in root.iter()
+        if loc.tag.endswith("loc") and loc.text and "sitemap_blogs" in loc.text
+    ]
+    if not blog_sitemaps:
+        return 0
+
+    total = 0
+    for sitemap_url in blog_sitemaps[:3]:
+        child = await _get(client, sitemap_url, attempts=1)
+        if child is None or child.status_code != 200:
+            continue
+        try:
+            child_root = ElementTree.fromstring(child.text)
+        except ElementTree.ParseError:
+            continue
+        total += sum(
+            1 for loc in child_root.iter()
+            if loc.tag.endswith("loc") and loc.text and "/blogs/" in loc.text
+        )
+    return total
 
 
-async def _fetch_subpages(client: httpx.AsyncClient, base_url: str, headers: dict) -> dict[str, Optional[str]]:
+async def _fetch_contact_subpages(client: httpx.AsyncClient, base_url: str) -> dict[str, Optional[str]]:
+    """Only the pages that carry contact details. Not used for provider detection."""
     paths = {
-        "about_us": "/pages/about-us",
-        "about": "/pages/about",
         "contact": "/pages/contact",
-        "blog_news": "/blogs/news",
-        "blog": "/blog",
-        "shipping": "/policies/shipping-policy",
-        "refund": "/policies/refund-policy",
-        "faq_page": "/pages/faq",
-        "faq": "/faq",
+        "shipping_policy": "/policies/shipping-policy",
+        "refund_policy": "/policies/refund-policy",
     }
-    subpage_contents = {}
+    out: dict[str, Optional[str]] = {}
 
-    async def fetch_one(key: str, path: str):
-        subpage_contents[key] = await _fetch_subpage(client, base_url, path, headers)
+    async def one(key: str, path: str) -> None:
+        response = await _get(
+            client, f"{base_url.rstrip('/')}{path}",
+            attempts=1, timeout=SUBPAGE_TIMEOUT_SECONDS,
+        )
+        if response is not None and response.status_code == 200:
+            # Reject the soft-404 that redirects back to the storefront root.
+            final_path = response.url.path.rstrip("/")
+            out[key] = None if final_path in ("", "/") else response.text
+        else:
+            out[key] = None
 
-    tasks = [fetch_one(key, path) for key, path in paths.items()]
-    await asyncio.gather(*tasks)
-    return subpage_contents
-
-
-def detect_email_provider(html: str) -> Optional[str]:
-    html_lower = html.lower()
-    providers = {
-        "klaviyo": "klaviyo",
-        "mailchimp": "mailchimp",
-        "omnisend": "omnisend",
-        "drip": "drip",
-        "sendlane": "sendlane",
-        "activecampaign": "activecampaign",
-        "postscript": "postscript",
-        "attentive": "attentive",
-        "privy": "privy",
-        "recart": "recart",
-        "smsbump": "smsbump",
-    }
-    for key, name in providers.items():
-        if key in html_lower:
-            return name
-    return None
+    await asyncio.gather(*(one(key, path) for key, path in paths.items()))
+    return out
 
 
-def detect_review_provider(html: str) -> Optional[str]:
-    html_lower = html.lower()
-    providers = {
-        "judge.me": "judge.me",
-        "judge-me": "judge-me",
-        "loox": "loox",
-        "yotpo": "yotpo",
-        "stamped": "stamped",
-        "okendo": "okendo",
-        "reviews.io": "reviews.io",
-        "ali reviews": "ali reviews",
-        "rivyo": "rivyo",
-        "ryviu": "ryviu",
-        "opinew": "opinew",
-    }
-    for key, name in providers.items():
-        if key in html_lower:
-            return name
-    return None
+async def _fetch_with_playwright(url: str, context) -> Optional[str]:
+    page = await context.new_page()
+
+    async def block_assets(route):
+        if route.request.resource_type in ("image", "stylesheet", "font", "media"):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    try:
+        await page.route("**/*", block_assets)
+        await page.goto(url, timeout=20_000, wait_until="domcontentloaded")
+        # Give sandboxed pixel/vendor scripts a moment to attach.
+        await page.wait_for_timeout(1_500)
+        return await page.content()
+    except Exception as exc:
+        logger.warning("Playwright fetch failed for %s: %s", url, exc)
+        return None
+    finally:
+        await page.close()
 
 
-def detect_loyalty_provider(html: str) -> Optional[str]:
-    html_lower = html.lower()
-    providers = {
-        "smile.io": "smile.io",
-        "loyaltylion": "loyaltylion",
-        "growave": "growave",
-        "yotpo loyalty": "yotpo loyalty",
-        "stamped loyalty": "stamped loyalty",
-        "rivo": "rivo",
-        "bon-loyalty": "bon-loyalty",
-    }
-    for key, name in providers.items():
-        if key in html_lower:
-            return name
-    return None
+# ── Orchestration ────────────────────────────────────────────────────────────
 
-
-def detect_chat_provider(html: str) -> Optional[str]:
-    html_lower = html.lower()
-    providers = {
-        "tidio": "tidio",
-        "gorgias": "gorgias",
-        "intercom": "intercom",
-        "zendesk": "zendesk",
-        "freshchat": "freshchat",
-        "livechat": "livechat",
-        "tawk.to": "tawk.to",
-        "drift": "drift",
-    }
-    for key, name in providers.items():
-        if key in html_lower:
-            return name
-    return None
-
-
-def detect_upsell_provider(html: str) -> Optional[str]:
-    html_lower = html.lower()
-    providers = {
-        "reconvert": "reconvert",
-        "zipify": "zipify",
-        "bold upsell": "bold upsell",
-        "frequently bought": "frequently bought",
-        "carthook": "carthook",
-        "aftersell": "aftersell",
-    }
-    for key, name in providers.items():
-        if key in html_lower:
-            return name
-    return None
-
-
-def detect_trust_provider(html: str) -> Optional[str]:
-    html_lower = html.lower()
-    providers = {
-        "mcafee": "mcafee",
-        "norton": "norton",
-        "trustpilot": "trustpilot",
-        "trusted-site": "trusted-site",
-        "buysafe": "buysafe",
-        "shopify-security-badge": "shopify-security-badge",
-        "ssl-certificate": "ssl-certificate",
-        "comodo": "comodo",
-        "verisign": "verisign",
-    }
-    for key, name in providers.items():
-        if key in html_lower:
-            return name
-    return None
-
-
-def count_social_links(html: str) -> int:
-    html_lower = html.lower()
-    social_tokens = ["instagram.com/", "facebook.com/", "tiktok.com/", "x.com/", "twitter.com/"]
-    count = 0
-    for token in social_tokens:
-        if token in html_lower:
-            count += 1
-    return count
-
-
-def extract_store_attributes(html: str, subpage_contents: dict[str, Optional[str]]) -> dict[str, Any]:
-    combined_html = html
-    for content in subpage_contents.values():
-        if content:
-            combined_html += "\n" + content
-
-    email_provider = detect_email_provider(combined_html)
-    review_provider = detect_review_provider(combined_html)
-    loyalty_provider = detect_loyalty_provider(combined_html)
-    chat_provider = detect_chat_provider(combined_html)
-    upsell_provider = detect_upsell_provider(combined_html)
-    trust_provider = detect_trust_provider(combined_html)
-    social_links_count = count_social_links(combined_html)
-
-    has_blog = bool(subpage_contents.get("blog_news") or subpage_contents.get("blog"))
-    has_about_page = bool(subpage_contents.get("about_us") or subpage_contents.get("about"))
-    has_faq = bool(
-        subpage_contents.get("faq_page") or
-        subpage_contents.get("faq") or
-        "faq" in html.lower() or
-        "frequently asked questions" in html.lower()
+def build_client() -> httpx.AsyncClient:
+    """One client per run — connection reuse and a shared cookie jar."""
+    return httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT_SECONDS),
+        headers={"User-Agent": USER_AGENT},
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
-    has_shipping_policy = bool(subpage_contents.get("shipping"))
-    has_refund_policy = bool(subpage_contents.get("refund"))
-
-    has_contact_page = bool(subpage_contents.get("contact"))
-    has_contact_email = "@" in html
-    has_contact = has_contact_page or has_contact_email or "contact" in html.lower()
-
-    # Calculate opportunity score
-    opportunity_score = 0
-    if email_provider is None:
-        opportunity_score += 2
-    if review_provider is None:
-        opportunity_score += 2
-    if loyalty_provider is None:
-        opportunity_score += 2
-    if chat_provider is None:
-        opportunity_score += 1
-    if upsell_provider is None:
-        opportunity_score += 2
-    if not has_blog:
-        opportunity_score += 1
-
-    return {
-        "email_provider": email_provider,
-        "review_provider": review_provider,
-        "loyalty_provider": loyalty_provider,
-        "chat_provider": chat_provider,
-        "upsell_provider": upsell_provider,
-        "trust_provider": trust_provider,
-        "social_links_count": social_links_count,
-        "has_blog": has_blog,
-        "has_about_page": has_about_page,
-        "has_faq": has_faq,
-        "has_shipping_policy": has_shipping_policy,
-        "has_refund_policy": has_refund_policy,
-        "has_contact": has_contact,
-        "has_meta_desc": 'name="description"' in html.lower(),
-        "has_og_title": 'property="og:title"' in html.lower(),
-        "opportunity_score": opportunity_score,
-    }
 
 
-async def fetch_store_data(url: str, browser_context=None) -> dict[str, Any]:
-    normalized_url = _normalize_url(url)
+async def fetch_store(
+    url: str,
+    client: httpx.AsyncClient,
+    browser_context=None,
+    retry_attempts: int = RETRY_ATTEMPTS,
+) -> dict[str, Any]:
+    """Fetch one storefront and return a fingerprinted, quality-assessed record."""
+    base_url = normalize_url(url)
+    method = "httpx"
 
-    html, json_products = await _fetch_with_httpx(normalized_url)
+    response = await _get(client, base_url, attempts=retry_attempts)
+    html = response.text if response is not None and response.status_code == 200 else None
+    status_code = response.status_code if response is not None else None
 
-    if not html and browser_context is not None:
-        logger.info("HTTP fetch failed for %s; using Playwright fallback", normalized_url)
-        html, pw_products = await _fetch_with_playwright(normalized_url, browser_context)
-        if pw_products and not json_products:
-            json_products = pw_products
+    # Escalate to a real browser when the response is missing OR present but
+    # unusable — a challenge page, a stub, or something with no Shopify markers.
+    needs_browser = (
+        html is None
+        or looks_like_challenge(html)
+        or len(html.encode("utf-8", errors="ignore")) < MIN_HTML_BYTES
+        or not any(ind in html.lower() for ind in SHOPIFY_INDICATORS)
+    )
+    if needs_browser and browser_context is not None:
+        logger.info("Escalating to Playwright for %s (http_status=%s)", base_url, status_code)
+        rendered = await _fetch_with_playwright(base_url, browser_context)
+        if rendered:
+            html, method = rendered, "playwright"
 
-    if html and is_dead_store(html):
-        logger.info("Dead/unavailable store detected: %s", normalized_url)
+    if not html:
         return {
-            "url": normalized_url,
-            "html": "",         # empty HTML signals dead store to scraper.py
-            "json_products": None,
-            "product_count": None,
-            "avg_price": None,
-            "store_name": normalized_url,
-            "is_dead": True,    # explicit flag
-            "is_shopify": False,
+            "url": base_url,
+            "status": STATUS_FETCH_FAILED,
+            "fetch_quality": {"scoreable": False, "reason": "no_html", "method": method,
+                              "http_status": status_code},
+            "fingerprint": None,
         }
 
-    if html and not is_shopify_store(html, json_products):
-        logger.info("Store is not a valid Shopify store: %s", normalized_url)
+    if is_dead_store(html):
         return {
-            "url": normalized_url,
-            "html": "",
-            "is_shopify": False,
+            "url": base_url,
+            "status": STATUS_DEAD,
+            "fetch_quality": {"scoreable": False, "reason": "dead_store", "method": method},
+            "fingerprint": None,
         }
 
-    headers = {"User-Agent": USER_AGENT}
-    subpages = {}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-        if html:
-            subpages = await _fetch_subpages(client, normalized_url, headers)
+    products = await _fetch_products(client, base_url)
 
-    product_count, avg_price = _extract_product_stats(json_products)
-    
-    attributes = extract_store_attributes(html or "", subpages) if html else {}
+    if not is_shopify_store(html, products):
+        return {
+            "url": base_url,
+            "status": STATUS_NOT_SHOPIFY,
+            "fetch_quality": {"scoreable": False, "reason": "not_shopify", "method": method},
+            "fingerprint": None,
+        }
+
+    fingerprint = build_fingerprint(html, base_url)
+    count, avg_price, titles = product_stats(products)
+    fingerprint["product_titles"] = titles
+    fingerprint["blog_article_count"] = await count_blog_articles(client, base_url)
+
+    subpages = await _fetch_contact_subpages(client, base_url)
+    quality = assess_quality(html, fingerprint, method)
 
     return {
-        "url": normalized_url,
-        "html": html or "",
-        "json_products": json_products,
-        "product_count": product_count,
+        "url": base_url,
+        "status": STATUS_OK,
+        "fingerprint": fingerprint,
+        "fetch_quality": quality,
+        "subpages": subpages,
+        "product_count": count,
         "avg_price": avg_price,
-        "store_name": _extract_store_name(html or "", normalized_url),
-        "is_shopify": True,
-        "attributes": attributes,
+        "store_name": fingerprint.get("store_name"),
     }

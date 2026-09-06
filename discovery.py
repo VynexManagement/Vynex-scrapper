@@ -30,6 +30,7 @@ import httpx
 from config import (
     COUNTRY_GL_MAP,
     COUNTRY_TLDS,
+    DISCOVERY_BREADTH_PAGES,
     DISCOVERY_MAX_PAGES_PER_QUERY,
     DISCOVERY_PAGE_SIZE,
     QUOTA_FAIL_OPEN,
@@ -39,6 +40,21 @@ from config import (
 logger = logging.getLogger(__name__)
 
 SERPAPI_URL = "https://serpapi.com/search"
+
+# Transport failures that happen *after* the request was dispatched, so SerpAPI
+# ran the search and billed for it even though we never read the answer.
+# Connect-phase errors (ConnectTimeout, ConnectError, PoolTimeout) and a
+# half-sent request (WriteTimeout) never reached them and stay free.
+_BILLED_TRANSPORT_ERRORS = (
+    httpx.ReadTimeout,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+
+# A read timeout costs a full billed search and returns nothing, so waiting is
+# strictly cheaper than retrying. Connect stays short — an unreachable SerpAPI
+# should fail fast, since that failure really is free.
+SERPAPI_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 EXCLUDED_DOMAINS = {
     "shopify.com", "myshopify.com", "google.com", "youtube.com",
@@ -270,6 +286,38 @@ class CursorStore:
             logger.warning("Cursor read failed for %s: %s", key, exc)
         return {"next_start": 0, "exhausted": False}
 
+    def get_many(self, queries: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Read every cursor at once, keyed by query string.
+
+        One round trip instead of the per-query `get()` the scheduler would
+        otherwise issue inside its loop. Ordering by depth needs all of them up
+        front anyway, so this is strictly fewer calls than before, not more.
+
+        A read failure degrades to "nothing explored yet" rather than halting:
+        the cost is a run that schedules in arbitrary order, not a lost run.
+        """
+        queries = list(queries)
+        by_key = {query_key(q): q for q in queries}
+        unseen: dict[str, dict[str, Any]] = {
+            q: {"next_start": 0, "exhausted": False} for q in queries
+        }
+        if self.supabase is None:
+            for key, query in by_key.items():
+                if key in self._local:
+                    unseen[query] = self._local[key]
+            return unseen
+        try:
+            res = (self.supabase.table("discovery_cursors")
+                   .select("query_hash,next_start,exhausted")
+                   .in_("query_hash", list(by_key)).execute())
+            for row in res.data or []:
+                query = by_key.get(row.get("query_hash"))
+                if query is not None:
+                    unseen[query] = row
+        except Exception as exc:
+            logger.warning("Bulk cursor read failed (%s) — scheduling unordered", exc)
+        return unseen
+
     def set(self, query: str, next_start: int, exhausted: bool) -> None:
         key = query_key(query)
         record = {"next_start": next_start, "exhausted": exhausted}
@@ -317,7 +365,9 @@ def build_queries(niche: Optional[str], country: Optional[str]) -> list[str]:
                     parts.append("-site:myshopify.com")
                     queries.append(" ".join(parts))
 
-    # Stable order, de-duplicated.
+    # Stable order, de-duplicated. Stability matters because `query_key` hashes
+    # the string: reordering is free, rewording orphans a cursor. Which query
+    # runs first is the scheduler's problem — see `schedule_queries`.
     seen: set[str] = set()
     ordered: list[str] = []
     for query in queries:
@@ -325,6 +375,36 @@ def build_queries(niche: Optional[str], country: Optional[str]) -> list[str]:
             seen.add(query)
             ordered.append(query)
     return ordered
+
+
+def schedule_queries(
+    queries: Iterable[str],
+    cursors: dict[str, dict[str, Any]],
+    seed: Optional[int] = None,
+) -> list[str]:
+    """Order queries least-explored first.
+
+    `build_queries` emits a deterministic permutation — niches in dict order, so
+    Beauty/skincare is always first — and `discover_stores` stops as soon as it
+    has `limit` domains. Together those meant a `--limit 50` AU run never got
+    past query six of 252: the same two Beauty queries were re-paginated deeper
+    on every run while seven niches were never issued at all. That, not market
+    saturation, is why 48% of results came back already-known on 6 Sep 2026.
+
+    Sorting by `next_start` puts never-issued queries (0) first and pushes the
+    deeply-drained ones last. Equal depths are shuffled so that ties — which on
+    a fresh corpus means *everything* — rotate between runs instead of falling
+    back to the dict order this exists to escape.
+    """
+    import random
+
+    rng = random.Random(seed)
+    ordered = list(queries)
+    rng.shuffle(ordered)
+    return sorted(
+        ordered,
+        key=lambda q: int((cursors.get(q) or {}).get("next_start") or 0),
+    )
 
 
 # ── SerpAPI ──────────────────────────────────────────────────────────────────
@@ -339,9 +419,16 @@ def _request_page(
     function retried up to three times internally, so recorded consumption could
     be a third of actual.
 
-    A transport error never reached SerpAPI and a 429 was refused rather than
-    served, so neither is counted; anything that came back with a response body
-    is. Exact billing semantics are not published, so this is a close
+    What counts as served turns on whether the request reached SerpAPI:
+
+      * A **connect-phase** failure never arrived, so it is free. Same for a 429,
+        which was refused rather than served.
+      * A **read** timeout or a mid-response protocol error *did* arrive and was
+        billed — we simply gave up reading the reply. Counting these as free was
+        measured wrong on 6 Sep 2026: a run modelled 23 searches while SerpAPI's
+        own counter charged 27, the gap being seven read timeouts.
+
+    Exact billing semantics are not published, so this is still an
     approximation — `sync_quota_from_account` reconciles against their counter
     at the start and end of every run.
     """
@@ -349,6 +436,13 @@ def _request_page(
     for attempt in range(1, retries + 1):
         try:
             response = client.get(SERPAPI_URL, params=params)
+        except _BILLED_TRANSPORT_ERRORS as exc:
+            # Reached SerpAPI and was served; we lost the response, not the search.
+            served += 1
+            logger.warning("SerpAPI request failed after dispatch (%s/%s): %s — counted as billed",
+                           attempt, retries, exc)
+            time.sleep(1.5 * attempt)
+            continue
         except httpx.HTTPError as exc:
             logger.warning("SerpAPI request failed (%s/%s): %s", attempt, retries, exc)
             time.sleep(1.5 * attempt)
@@ -402,9 +496,19 @@ def discover_stores(
     known = {d.lower() for d in (known_domains or [])}
     cursors = CursorStore(supabase)
     queries = build_queries(niche, country)
+    cursor_by_query = cursors.get_many(queries)
+    queries = schedule_queries(queries, cursor_by_query)
+    unexplored = sum(1 for c in cursor_by_query.values() if not int(c.get("next_start") or 0))
+
+    # Breadth and depth were measured as independent multipliers, and breadth was
+    # the one going unused: a small-limit run drained the head of the list while
+    # hundreds of queries sat at page 0. While untouched queries remain, cap depth
+    # so the run spends its credits across niches instead of down one.
+    max_pages = DISCOVERY_BREADTH_PAGES if unexplored else DISCOVERY_MAX_PAGES_PER_QUERY
     logger.info(
-        "Discovery: niche=%s country=%s limit=%s across %s distinct queries",
-        niche, country, limit, len(queries),
+        "Discovery: niche=%s country=%s limit=%s across %s distinct queries "
+        "(%s never issued, max %s pages each)",
+        niche, country, limit, len(queries), unexplored, max_pages,
     )
 
     found: dict[str, None] = {}
@@ -414,19 +518,19 @@ def discover_stores(
     # nothing — and you retire the query instead of fixing the modifier.
     drops = {"excluded": 0, "myshopify": 0, "market": 0, "known": 0, "unverified": 0}
 
-    with httpx.Client(follow_redirects=True, timeout=20) as client:
+    with httpx.Client(follow_redirects=True, timeout=SERPAPI_TIMEOUT) as client:
         for query in queries:
             if len(found) >= limit:
                 break
 
-            cursor = cursors.get(query)
+            cursor = cursor_by_query.get(query) or {"next_start": 0, "exhausted": False}
             if cursor.get("exhausted"):
                 continue
 
             start = int(cursor.get("next_start") or 0)
             pages = 0
 
-            while len(found) < limit and pages < DISCOVERY_MAX_PAGES_PER_QUERY:
+            while len(found) < limit and pages < max_pages:
                 if supabase is not None and not allow_unmetered:
                     if not check_and_increment_quota(supabase):
                         logger.warning("SerpAPI quota exhausted — halting discovery")

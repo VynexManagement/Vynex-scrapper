@@ -29,6 +29,12 @@ SERPAPI_MONTHLY_LIMIT = 250
 QUOTA_FAIL_OPEN = False
 DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_MAX_PAGES_PER_QUERY = 10
+# Depth cap applied while any query has never been issued. Breadth and depth
+# multiply independently, so an unexplored query is worth more than another page
+# of an already-drained one — 48% of a 6 Sep 2026 AU run came back already-known
+# because the run went deep on two Beauty queries and never reached the other
+# seven niches. Lifts to DISCOVERY_MAX_PAGES_PER_QUERY once everything is touched.
+DISCOVERY_BREADTH_PAGES = 3
 
 # ── Fetching ─────────────────────────────────────────────────────────────────
 SCRAPER_CONCURRENCY = 3
